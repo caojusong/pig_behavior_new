@@ -46,7 +46,8 @@ model = dict(
             conv1_stride_t=1,
             pool1_stride_t=1,
             inflate=(0, 0, 1, 1),
-            spatial_strides=(1, 2, 2, 1)),
+            spatial_strides=(1, 2, 2, 1),
+            ),
         fast_pathway=dict(
             type='resnet3d',
             depth=50,
@@ -56,7 +57,16 @@ model = dict(
             conv1_kernel=(5, 7, 7),
             conv1_stride_t=1,
             pool1_stride_t=1,
-            spatial_strides=(1, 2, 2, 1))),
+            spatial_strides=(1, 2, 2, 1),
+            #with_tam=True,
+            #tam_cfg=dict(num_segments=8, reduction=4),
+                # ↓↓↓ 新增 ↓↓↓
+            # is_fast_path=True,
+            # with_tam=True,
+            # tam_mode='sameT',
+            # tam_num_segments=32,  # 先写 32，下一步打印确认
+            # tam_kernel_size=3,
+            )),
     roi_head=dict(
         type='AVARoIHead',
         bbox_roi_extractor=dict(
@@ -66,13 +76,15 @@ model = dict(
             with_temporal_pool=True),
         bbox_head=dict(
             type='BBoxHeadAVA',
-            background_class=False,
+            background_class=True,
             in_channels=2304,
             num_classes=6,
             multilabel=False,                 #使用单标签
             dropout_ratio=0.5,
-            #focal_gamma=2.0,    # Focal Loss γ，一般设 1~2
-            #focal_alpha=0.25,   # Focal Loss α，常用 0.25
+            # focal_gamma=2,    # Focal Loss γ，一般设 1~2
+            # focal_alpha=0.75,   # Focal Loss α，常用 0.25
+            focal_gamma=0,    # Focal Loss γ，一般设 1~2
+            focal_alpha=1,   # Focal Loss α，常用 0.25
             )),
     data_preprocessor=dict(
         type='mmaction.ActionDataPreprocessor',
@@ -141,8 +153,8 @@ val_pipeline = [
 ]
 
 train_dataloader = dict(
-    batch_size=8,
-    num_workers=4,
+    batch_size=16,
+    num_workers=8,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
@@ -152,7 +164,11 @@ train_dataloader = dict(
         pipeline=train_pipeline,
         label_file=label_file,
         proposal_file=proposal_file_train,
-        data_prefix=dict(img=data_root)))
+        data_prefix=dict(img=data_root),
+        #  加上时间范围（秒数转帧数）
+        # timestamp_start=0,      # 0s
+        # timestamp_end=300,      # 300s = 9000帧
+        ))
 val_dataloader = dict(
     batch_size=1,
     num_workers=1,
@@ -166,6 +182,9 @@ val_dataloader = dict(
         label_file=label_file,
         proposal_file=proposal_file_val,
         data_prefix=dict(img=data_root),
+        #  加上时间范围（秒数转帧数）
+        # timestamp_start=120,      # 0s
+        # timestamp_end=300,      # 300s = 9000帧
         test_mode=True))
 test_dataloader = val_dataloader
 
