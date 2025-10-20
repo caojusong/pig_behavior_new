@@ -16,7 +16,7 @@ from torch import Tensor
 
 from mmaction.structures.bbox import bbox_target
 from mmaction.utils import InstanceList
-
+import torch.distributed as dist  # 文件顶部如果没有就加
 if pv.parse(torch.__version__) < pv.parse('1.10'):
 
     def cross_entropy_loss(input, target, reduction='None'):
@@ -40,14 +40,14 @@ class BBoxHeadAVA(nn.Module):
         temporal_pool_type (str): 时间维度的池化类型，可选值为``avg``（平均池化）或``max``（最大池化），默认使用平均池化（``avg``）。
         spatial_pool_type (str): 空间维度的池化类型，可选值为``avg``（平均池化）或``max``（最大池化），默认使用最大池化（``max``）。
         in_channels (int): 输入特征的通道数,默认值为2048。
-        focal_alpha (float): Focal Loss的超参数α(阿尔法)。当``alpha=1``且``gamma=0``时，Focal Loss退化为带Sigmoid的二分类交叉熵损失（BCELossWithLogits），默认值为1。
-        focal_gamma (float): Focal Loss的超参数γ（伽马）。当``alpha=1``且``gamma=0``时，Focal Loss退化为BCELossWithLogits，默认值为0。
-        num_classes (int): 目标分类的类别数，默认值为81。
-        dropout_ratio (float): Dropout层的丢弃比例（取值范围``[0, 1]``），用于防止过拟合。默认值为0（不启用Dropout）。
-        dropout_before_pool (bool): 是否在时空池化（spatial temporal pooling）前应用Dropout。默认值为True（在池化前丢弃部分特征）。
-        topk (int 或 Tuple[int]): 用于评估Top-K准确率的参数。默认值为``(3, 5)``（即计算前3和前5正确的准确率）。
-        multilabel (bool): 是否用于多标签分类任务（一个样本可能属于多个类别）。默认值为True（支持多标签）。
-        mlp_head (bool): 是否使用MLP（多层感知机）作为分类头。若为False（默认），则仅用单个线性层（``nn.Linear``若为True,则使用两层线性层带ReLU激活。
+        focal_alpha (float): Focal Loss的超参数(阿尔法)。当``alpha=1``且``gamma=0``时,Focal Loss退化为带Sigmoid的二分类交叉熵损失(BCELossWithLogits),默认值为1。
+        focal_gamma (float): Focal Loss的超参数(伽马)。当``alpha=1``且``gamma=0``时,Focal Loss退化为BCELossWithLogits,默认值为0。
+        num_classes (int): 目标分类的类别数,默认值为81。
+        dropout_ratio (float): Dropout层的丢弃比例(取值范围``[0, 1]``),用于防止过拟合。默认值为0(不启用Dropout)。
+        dropout_before_pool (bool): 是否在时空池化(spatial temporal pooling)前应用Dropout。默认值为True(在池化前丢弃部分特征)。
+        topk (int 或 Tuple[int]): 用于评估Top-K准确率的参数。默认值为``(3, 5)``(即计算前3和前5正确的准确率)。
+        multilabel (bool): 是否用于多标签分类任务(一个样本可能属于多个类别)。默认值为True(支持多标签）。
+        mlp_head (bool): 是否使用MLP(多层感知机)作为分类头。若为False(默认)，则仅用单个线性层（``nn.Linear``若为True,则使用两层线性层带ReLU激活。
     """
 
     def __init__(
@@ -58,7 +58,7 @@ class BBoxHeadAVA(nn.Module):
             in_channels: int = 2048,
             focal_gamma: float = 0.,
             focal_alpha: float = 1.,
-            num_classes: int = 81,  # First class reserved (BBox as pos/neg)
+            num_classes: int = 6,  # First class reserved (BBox as pos/neg)
             dropout_ratio: float = 0,
             dropout_before_pool: bool = True,
             topk: Union[int, Tuple[int]] = (3, 5),
@@ -125,33 +125,33 @@ class BBoxHeadAVA(nn.Module):
                 nn.init.xavier_normal_(m.weight)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:   #(时域池化) → (空域池化) → (展平) → (全连接分类)。
         """Computes the classification logits given ROI features."""
-        if self.dropout_before_pool and self.dropout_ratio > 0:
+        if self.dropout_before_pool and self.dropout_ratio > 0:   # 检查是否需要在池化前应用 Dropout，并且 Dropout 比例大于 0
             x = self.dropout(x)
 
-        x = self.temporal_pool(x)
-        x = self.spatial_pool(x)
+        x = self.temporal_pool(x)                                # 对输入特征 x 进行时间维度的池化操作
+        x = self.spatial_pool(x)                                 # 对经过时间池化后的特征 x 进行空间维度的池化操作
 
-        if not self.dropout_before_pool and self.dropout_ratio > 0:
+        if not self.dropout_before_pool and self.dropout_ratio > 0: 
             x = self.dropout(x)
 
-        x = x.view(x.size(0), -1)
+        x = x.view(x.size(0), -1)                               # 将特征 x 展平为二维张量，第一维为批次大小，第二维为剩余维度的乘积
         cls_score = self.fc_cls(x)      
         return cls_score
 
     @staticmethod
     def get_targets(sampling_results: List[SamplingResult],
                     rcnn_train_cfg: ConfigDict) -> tuple:
-        pos_proposals = [res.pos_priors for res in sampling_results]
-        neg_proposals = [res.neg_priors for res in sampling_results]
-        pos_gt_labels = [res.pos_gt_labels for res in sampling_results]
+        pos_proposals = [res.pos_priors for res in sampling_results]    #使用列表推导式从 sampling_results 列表中提取每个 SamplingResult 对象的正样本建议框（pos_priors），最终得到一个包含所有正样本建议框的列表。
+        neg_proposals = [res.neg_priors for res in sampling_results]    #提取每个 SamplingResult 对象的负样本建议框（neg_priors），得到一个包含所有负样本建议框的列表。
+        pos_gt_labels = [res.pos_gt_labels for res in sampling_results] #提取每个 SamplingResult 对象的正样本对应的真实标签（pos_gt_labels），得到一个包含所有正样本真实标签的列表
         cls_targets = bbox_target(pos_proposals, neg_proposals, pos_gt_labels,
                                   rcnn_train_cfg)
         return cls_targets
 
     @staticmethod
-    def get_recall_prec(pred_vec: Tensor, target_vec: Tensor) -> tuple:
+    def get_recall_prec(pred_vec: Tensor, target_vec: Tensor) -> tuple:    #该方法用于计算多标签和单标签场景下的召回率（Recall）和精确率（Precision），采用的是微观平均（micro average）的计算方式
         """Computes the Recall/Precision for both multi-label and single label
         scenarios.
 
@@ -170,7 +170,7 @@ class BBoxHeadAVA(nn.Module):
         return recall.mean(), prec.mean()
 
     @staticmethod
-    def topk_to_matrix(probs: Tensor, k: int) -> Tensor:
+    def topk_to_matrix(probs: Tensor, k: int) -> Tensor:    #主要功能是将概率矩阵 probs 转换为一个二进制矩阵，该矩阵标记出每个样本概率最高的前 k 个类别
         """Converts top-k to binary matrix."""
         topk_labels = probs.topk(k, 1, True, True)[1]
         topk_matrix = probs.new_full(probs.size(), 0, dtype=torch.bool)
@@ -182,7 +182,7 @@ class BBoxHeadAVA(nn.Module):
                       pred: Tensor,
                       target: Tensor,
                       thr: float = 0.5) -> tuple:
-        """Computes the Top-K Accuracies for both single and multi-label
+        """Computes the Top-K Accuracies for both single and multi-label           #定义了 BBoxHeadAVA 类中的 topk_accuracy 方法，该方法用于计算单标签和多标签场景下的 Top-K 召回率和精确率
         scenarios."""
         # Define Target vector:
         target_bool = target > 0.5
@@ -213,18 +213,15 @@ class BBoxHeadAVA(nn.Module):
 
     def loss_and_target(self, cls_score: Tensor, rois: Tensor,
                         sampling_results: List[SamplingResult],
-                        rcnn_train_cfg: ConfigDict, **kwargs) -> dict:
+                        rcnn_train_cfg: ConfigDict, **kwargs) -> dict:        #该方法的主要功能是基于边界框头提取的特征计算损失，并生成分类目标
         """Calculate the loss based on the features extracted by the bbox head.
 
         Args:
-            cls_score (Tensor): Classification prediction
-                results of all class, has shape
-                (batch_size * num_proposals_single_image, num_classes)
-            rois (Tensor): RoIs with the shape
-                (batch_size * num_proposals_single_image, 5) where the first
-                column indicates batch id of each RoI.
-            sampling_results (List[obj:SamplingResult]): Assign results of
-                all images in a batch after sampling.
+            cls_score:分类预测结果张量,形状为 (batch_size * num_proposals_single_image, num_classes)。
+            rois:感兴趣区域(RoIs)张量,形状为 (batch_size * num_proposals_single_image, 5)，第一列表示每个 RoI 所属的批次 ID。
+            sampling_results:一个包含 SamplingResult 对象的列表，代表批量中所有图像采样后的分配结果。
+            rcnn_train_cfg:RCNN 的训练配置对象。
+            **kwargs:可变关键字参数，但在方法中未被使用。
             rcnn_train_cfg (obj:ConfigDict): `train_cfg` of RCNN.
 
         Returns:
@@ -232,53 +229,71 @@ class BBoxHeadAVA(nn.Module):
         """
         cls_targets = self.get_targets(sampling_results, rcnn_train_cfg)
         labels, _ = cls_targets
+        # —— 新增：打印本批次里到底有哪些标签 ID ——  
+        #print("Unique labels in this batch:", labels.unique().cpu().tolist())
         losses = dict()          #修改为单标签，多标签返回返回的是 one-hot 向量（多标签格式）
         # Only use the cls_score
+        # 1) 如果你开启了 background_class，那么先把背景通道抹掉
         if cls_score is not None:
             if self.background_class:
                 labels = labels[:, 1:]  # Get valid labels (ignore first one)
                 cls_score = cls_score[:, 1:]
-            pos_inds = torch.sum(labels, dim=-1) > 0
+            # 2) 只对至少一个前景为 1 的行计算（丢掉全 0 的背景 ROI）
+            pos_inds = torch.sum(labels, dim=-1) > 0     #创建一个布尔索引，标记哪些样本是正样本（标签中至少有一个类别为 1）
             cls_score = cls_score[pos_inds]
             labels = labels[pos_inds]
 
-            # Compute First Recall/Precisions
-            #   This has to be done first before normalising the label-space.
-            recall_thr, prec_thr, recall_k, prec_k = self.topk_accuracy(
-                cls_score, labels, thr=0.5)
-            losses['recall@thr=0.5'] = recall_thr
-            losses['prec@thr=0.5'] = prec_thr
-            for i, k in enumerate(self.topk):
-                losses[f'recall@top{k}'] = recall_k[i]
-                losses[f'prec@top{k}'] = prec_k[i]
 
-            # If Single-label, need to ensure that target labels sum to 1: ie
-            #   that they are valid probabilities.
+            # if not hasattr(self, '_debug_printed'):
+            #     is_main = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+            #     if is_main:
+            #         print('\n====== DEBUG (BBoxHeadAVA.loss_and_target) ======')
+            #         print('cls_score.shape =', tuple(cls_score.shape))         # 期望 (N, 6)
+            #         print('labels.shape    =', tuple(labels.shape))            # 期望 (N, 6)  (单标签 one-hot)
+            #         print('row-sum(labels) 前10个 =', labels.float().sum(1)[:10].cpu().tolist())
+            #         # 看看是不是每行恰好 1（单标签 one-hot）
+            #         probs = cls_score.softmax(1)
+            #         top3 = probs.topk(3, dim=1).indices[:10].cpu().tolist()
+            #         print('top3 index 前10行 =', top3)
+            #         print('===============================================\n')
+            #     self._debug_printed = True
+        # —— 只打一次：显示本批次真正出现的类别 ID ——  
+            if not hasattr(self, '_debug_printed'):
+                is_main = (not dist.is_available()) \
+                        or (not dist.is_initialized()) \
+                        or dist.get_rank() == 0
+                if is_main:
+                    # 单标签：每行只有一个 1，我们先 argmax 得到类别索引
+                    labels_idx = labels.argmax(dim=1)
+                    unique_ids = labels_idx.unique().cpu().tolist()
+                    print(f"DEBUG batch classes: {unique_ids}")
+                self._debug_printed = True
+            # ---------- 单标签、无背景 ----------
+            # 3) 单标签断言 & idx 转换
             if not self.multilabel:
-                # 1) 先把 one‑hot → 整数索引，给 CE 用
-                labels_index = labels.argmax(dim=1)          # (N,)
+                assert (labels.sum(1) == 1).all(), '单标签任务要求 one-hot'
 
-                # 2) 交叉熵 +（可选）Focal 变体
-                loss = cross_entropy_loss(cls_score, labels_index, reduction='none')
-                pt = torch.exp(-loss)
-                F_loss = self.focal_alpha * (1 - pt) ** self.focal_gamma * loss
-                losses['loss_action_cls'] = F_loss.mean()
-                # 3) 为了算 top‑k / AVAMetric，再恢复 one‑hot 版
-                #    用 cls_score 的通道数（background_class=True 后是 num_classes-1）
-                num_pred_classes = cls_score.size(1)
-                labels_for_metric = F.one_hot(labels_index,
-                                              num_classes=num_pred_classes).float()
-                # 计算指标
+                labels_idx = labels.argmax(1)                 # (N,)  ## 将独热编码转换为类别索引
+                probs = cls_score.softmax(1)                  # (N,5)  ## 计算每个类别的概率
+                pt = probs[torch.arange(labels_idx.numel()), labels_idx] ## 获取每个样本对应真实类别的概率
+                ce = F.cross_entropy(cls_score, labels_idx, reduction='none')  ## 计算交叉熵损失
+
+                alpha = self.focal_alpha                     ## 获取Focal Loss的alpha参数
+                if isinstance(alpha, torch.Tensor):
+                    alpha = alpha[labels_idx]                 # (N,)   # (N,) 为每个样本选择对应的alpha
+
+                focal = alpha * (1 - pt) ** self.focal_gamma * ce    # 计算Focal Loss
+                losses['loss_action_cls'] = focal.mean()
+
+                # —— 仅此一次指标计算 ——
                 recall_thr, prec_thr, recall_k, prec_k = self.topk_accuracy(
-                    cls_score, labels_for_metric, thr=0.5)
-                losses['recall@thr=0.5'] = recall_thr
-                losses['prec@thr=0.5'] = prec_thr
+                    cls_score, labels, thr=0.5)
+                losses['recall@top1'] = recall_thr
+                losses['prec@top1']   = prec_thr
                 for i, k in enumerate(self.topk):
                     losses[f'recall@top{k}'] = recall_k[i]
-                    losses[f'prec@top{k}']  = prec_k[i]
+                    losses[f'prec@top{k}']   = prec_k[i]
 
-                # 把 one‑hot 版传回，供 AVAMetric 使用
-                labels = labels_for_metric
 #原版
 # Select Loss function based on single/multi-label
 #   NB. Both losses auto-compute sigmoid/softmax on prediction
@@ -294,7 +309,6 @@ class BBoxHeadAVA(nn.Module):
 #losses['loss_action_cls'] = torch.mean(F_loss)
 
         return dict(loss_bbox=losses, bbox_targets=cls_targets)
-
     def predict_by_feat(self,
                         rois: Tuple[Tensor],
                         cls_scores: Tuple[Tensor],
