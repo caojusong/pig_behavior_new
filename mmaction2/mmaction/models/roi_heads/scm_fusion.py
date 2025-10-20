@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+####这个是没有加通道注意力的一版###
 class SCMFusionTransformer(nn.Module):
     """
     视觉 × 轨迹 的 Transformer 融合（两 token：vis、traj，简单聚合版）
@@ -155,3 +155,142 @@ class SCMFusionTransformer(nn.Module):
             self._printed = True
 
         return out
+####下一版####
+加了注意力一版
+import torch
+import torch.nn as nn
+
+class SE1d(nn.Module):
+    """Squeeze-Excitation for 1D channel vectors.
+       支持 (N,C) 或 (N,T,C)；(N,T,C) 会对 T 做平均得到通道权重。"""
+    def __init__(self, channels: int, reduction: int = 16,
+                 act=nn.ReLU, gate=nn.Sigmoid):
+        super().__init__()
+        hidden = max(1, channels // reduction)
+        self.fc1 = nn.Linear(channels, hidden, bias=True)
+        self.fc2 = nn.Linear(hidden, channels, bias=True)
+        self.act = act()
+        self.gate = gate()
+
+    def forward(self, x):
+        # x: (N,C) or (N,T,C)
+        if x.dim() == 3:
+            s = x.mean(dim=1)  # (N,C)
+        else:
+            s = x              # (N,C)
+        w = self.gate(self.fc2(self.act(self.fc1(s))))  # (N,C)
+        if x.dim() == 3:
+            w = w.unsqueeze(1)  # (N,1,C)
+        return x * w
+
+
+class SCMFusionTransformer(nn.Module):
+    """
+    两路输入（视觉/轨迹）→ 同维映射 → ① 分支端 SE → 融合（mean/transformer）
+                             → ②（可选）融合后 SE → 输出指定维度
+
+    关键改动（稳定训练）：
+      1) 投影前 LayerNorm（视觉/轨迹各一）：解决两路特征“尺度不匹配”；
+      2) out_proj 全零初始化 + 视觉残差：起步输出≈原视觉分布，不劣于基线；
+      3) （可选）轨迹前 3 维做固定缩放，把 dx,dy,dist 先粗归一化再 LN。
+    """
+    def __init__(self,
+                 vis_dim=2304,
+                 traj_dim=2304,
+                 model_dim=256,
+                 num_layers=2,
+                 num_heads=8,
+                 dropout=0.1,
+                 output_dim=2304,
+                 enhanced=False,             # 兼容旧字段：可用来打开融合后 SE
+                 fusion_type='transformer',  # 'mean' | 'transformer'
+                 # —— ① 分支端 SE（推荐默认开）——
+                 use_ca_vis=True,
+                 use_ca_traj=True,
+                 ca_reduction=16,
+                 # —— ② 融合后 SE（可选，默认关；若 enhanced=True 则强制打开）——
+                 use_ca_post=False,
+                 # mean 融合下的轨迹注入比例
+                 gate_alpha=0.25):
+        super().__init__()
+        self.fusion_type  = fusion_type
+        self.use_ca_vis   = use_ca_vis
+        self.use_ca_traj  = use_ca_traj
+        self.use_ca_post  = bool(use_ca_post or enhanced)
+        self.gate_alpha   = gate_alpha
+
+        # >>> NEW: 投影前 LayerNorm，统一两路特征的分布（零均值/单位方差）
+        self.ln_vis  = nn.LayerNorm(vis_dim)
+        self.ln_traj = nn.LayerNorm(traj_dim)
+
+        # 投到统一维度
+        self.vis_proj  = nn.Linear(vis_dim,  model_dim)
+        self.traj_proj = nn.Linear(traj_dim, model_dim)
+
+        # ① 分支端 SE
+        if use_ca_vis:
+            self.ca_vis  = SE1d(model_dim, reduction=ca_reduction)
+        if use_ca_traj:
+            self.ca_traj = SE1d(model_dim, reduction=ca_reduction)
+
+        # 融合模块
+        if fusion_type == 'transformer':
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=model_dim, nhead=num_heads,
+                dim_feedforward=4 * model_dim,
+                dropout=dropout, activation='gelu',
+                batch_first=True
+            )
+            self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        # ② 融合后 SE（可选，残差更稳）
+        if self.use_ca_post:
+            self.ca_post = SE1d(model_dim, reduction=ca_reduction)
+
+        # 输出到 ROIHead 需要的通道（通常 2304）
+        self.out_proj = nn.Linear(model_dim, output_dim)
+
+        # >>> NEW: out_proj 全零初始化，确保初始 fused≈vis_feat（不破坏旧分布）
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, vis_feat, traj_feat):
+        # >>> NEW: 保存“原始视觉特征”作残差基线（与 bbox_head 旧分布对齐）
+        vis_base = vis_feat
+
+        # >>> NEW (可选)：若轨迹前 3 维是 dx,dy,dist，先做固定缩放以粗归一化
+        # dx,dy ∈ [-1.5,1.5]，dist_water ~ [0,2] → 乘 [1/1.5, 1/1.5, 1/2]
+        if traj_feat.shape[1] >= 3:
+            scale = torch.tensor([1/1.5, 1/1.5, 1/2.0],
+                                 device=traj_feat.device, dtype=traj_feat.dtype)
+            traj_feat = traj_feat.clone()
+            traj_feat[:, :3] = traj_feat[:, :3] * scale
+
+        # 1) 投影前先做 LN，把两路对齐到 ~N(0,1)，减少“尺度不匹配”的优化负担
+        v = self.vis_proj(self.ln_vis(vis_feat))   # (N, C)
+        t = self.traj_proj(self.ln_traj(traj_feat))# (N, C)
+
+        # 2) ① 分支端 SE（轻权重的通道重标定）
+        if self.use_ca_vis:
+            v = self.ca_vis(v)
+        if self.use_ca_traj:
+            t = self.ca_traj(t)
+
+        # 3) 融合（transformer 或稳定的 mean 融合）
+        if self.fusion_type == 'transformer':
+            seq = torch.stack([v, t], dim=1)   # (N,2,C)
+            enc = self.enc(seq)                # (N,2,C)
+            agg = enc.mean(dim=1)              # 简单聚合（稳定）
+        else:
+            alpha = self.gate_alpha
+            agg = (1 - alpha) * v + alpha * t  # (N,C)
+
+        # 4) ② 融合后 SE（可选，做成残差）
+        if self.use_ca_post:
+            agg = agg + self.ca_post(agg)
+
+        # 5) 输出到下游维度 —— 用“视觉残差 + out_proj(增益)”
+        #    out_proj 已零初始化 → 初始 fused ≈ vis_base（不惊扰 ROIHead 的统计）
+        fused = vis_base + self.out_proj(agg)  # (N, output_dim)
+        return fused
